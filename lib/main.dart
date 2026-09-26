@@ -102,8 +102,10 @@ Future<ProcessResult> runCommand(
 }
 
 Future<List<Listener>> discoverListeners({bool admin = false}) async {
-  final command = <String>['ss', '-H', '-ltnup'];
-  if (admin) command.insertAll(0, ['pkexec']);
+  final command = Platform.isWindows
+      ? <String>['netstat', '-ano']
+      : <String>['ss', '-H', '-ltnup'];
+  if (admin && !Platform.isWindows) command.insertAll(0, ['pkexec']);
   late ProcessResult result;
   try {
     result = await runCommand(command);
@@ -119,7 +121,9 @@ Future<List<Listener>> discoverListeners({bool admin = false}) async {
           : result.stderr,
     );
   }
-  final listeners = parseListeners('${result.stdout}');
+  final listeners = Platform.isWindows
+      ? parseNetstatListeners('${result.stdout}')
+      : parseListeners('${result.stdout}');
   final bindings = await discoverDockerBindings();
   return listeners.map((listener) => correlate(listener, bindings)).toList()
     ..sort(
@@ -127,6 +131,33 @@ Future<List<Listener>> discoverListeners({bool admin = false}) async {
           ? a.port.compareTo(b.port)
           : a.protocol.compareTo(b.protocol),
     );
+}
+
+List<Listener> parseNetstatListeners(String output) {
+  final listeners = <Listener>[];
+  for (final line in output.split('\n')) {
+    final parts = line.trim().split(RegExp(r'\s+'));
+    if (parts.length < 4) continue;
+    final protocol = parts.first.toLowerCase();
+    if (protocol != 'tcp' && protocol != 'udp') continue;
+    final endpoint = parseEndpoint(parts[1]);
+    if (endpoint == null) continue;
+    if (protocol == 'tcp' &&
+        (parts.length < 5 || parts[3].toUpperCase() != 'LISTENING')) {
+      continue;
+    }
+    final pid = int.tryParse(parts.last);
+    if (pid == null) continue;
+    listeners.add(
+      Listener(
+        protocol: protocol,
+        address: endpoint.$1,
+        port: endpoint.$2,
+        pid: pid,
+      ),
+    );
+  }
+  return listeners;
 }
 
 List<Listener> parseListeners(String output) {
@@ -454,7 +485,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
           builder: (context) => AlertDialog(
             title: const Text('Stop listener owner?'),
             content: Text(
-              'Stop $target?\n\nListening socket: ${listener.address}:${listener.port}/${listener.protocol}\n\nThe owner receives SIGTERM. Port Guardian never silently sends SIGKILL.',
+              'Stop $target?\n\nListening socket: ${listener.address}:${listener.port}/${listener.protocol}\n\n${Platform.isWindows ? 'Windows requires forced process termination for this action.' : 'The owner receives SIGTERM. Port Guardian never silently sends SIGKILL.'}',
             ),
             actions: [
               TextButton(
@@ -505,6 +536,23 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
 
 Future<ActionResult> terminateProcess(int pid) async {
   try {
+    if (Platform.isWindows) {
+      final result = await runCommand([
+        'taskkill',
+        '/PID',
+        '$pid',
+        '/T',
+        '/F',
+      ], timeout: const Duration(seconds: 5));
+      return result.exitCode == 0
+          ? const ActionResult(true, 'The process termination was requested.')
+          : ActionResult(
+              false,
+              '${result.stderr}'.trim().isEmpty
+                  ? 'Permission or termination was denied.'
+                  : '${result.stderr}'.trim(),
+            );
+    }
     var result = await runCommand([
       'kill',
       '-TERM',
