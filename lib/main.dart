@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -7,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'models/action_result.dart';
 import 'models/listener.dart';
 import 'repo/services.dart';
+import 'widgets/empty_state.dart';
+import 'widgets/listener_tile.dart';
 
 void main() => runApp(const MainApp());
 
@@ -95,13 +96,13 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final content = error != null
-        ? _EmptyState(
+        ? EmptyState(
             icon: Icons.warning_amber_rounded,
             title: 'Unable to scan sockets',
             detail: error!,
           )
         : visibleEntries.isEmpty
-        ? _EmptyState(
+        ? EmptyState(
             icon: Icons.lan_outlined,
             title: entries.isEmpty
                 ? 'No listening sockets found'
@@ -385,125 +386,4 @@ Future<ActionResult> stopContainer(String id) async {
       'Docker is not installed or is no longer available.',
     );
   }
-}
-
-class ListenerTile extends StatelessWidget {
-  const ListenerTile({super.key, required this.listener, required this.onStop});
-  final ListenerObject listener;
-  final VoidCallback onStop;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final exposureColor = listener.exposure == 'Network exposed'
-        ? const Color(0xffffb86b)
-        : listener.exposure == 'Local only'
-        ? const Color(0xff70d5a5)
-        : const Color(0xff8ab4d6);
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xff151e1f),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xff263332)),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 62,
-            child: Text(
-              '${listener.port}',
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${listener.protocol.toUpperCase()}  ${listener.address}:${listener.port}',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 16,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Wrap(
-                  spacing: 12,
-                  runSpacing: 4,
-                  children: [
-                    Text(
-                      listener.process,
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    Text(
-                      listener.pid == null
-                          ? 'owner hidden'
-                          : 'PID ${listener.pid}',
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    Text(
-                      listener.source,
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    Text(
-                      listener.exposure,
-                      style: TextStyle(
-                        color: exposureColor,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 12),
-          IconButton(
-            tooltip: 'Stop owner gracefully',
-            onPressed: onStop,
-            icon: Icon(
-              Icons.stop_circle_outlined,
-              color: theme.colorScheme.error,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({
-    required this.icon,
-    required this.title,
-    required this.detail,
-  });
-  final IconData icon;
-  final String title;
-  final String detail;
-
-  @override
-  Widget build(BuildContext context) => Center(
-    child: Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(icon, size: 46, color: const Color(0xff5d716e)),
-        const SizedBox(height: 14),
-        Text(
-          title,
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-        ),
-        const SizedBox(height: 6),
-        Text(detail, style: const TextStyle(color: Color(0xff94a4a2))),
-      ],
-    ),
-  );
 }
