@@ -4,6 +4,10 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'models/action_result.dart';
+import 'models/listener.dart';
+import 'repo/services.dart';
+
 void main() => runApp(const MainApp());
 
 class MainApp extends StatelessWidget {
@@ -12,7 +16,7 @@ class MainApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'Port Guardian',
+    title: 'Port Guard',
     theme: ThemeData(
       brightness: Brightness.dark,
       colorScheme: ColorScheme.fromSeed(
@@ -27,245 +31,6 @@ class MainApp extends StatelessWidget {
   );
 }
 
-class Listener {
-  const Listener({
-    required this.protocol,
-    required this.address,
-    required this.port,
-    this.process = '-',
-    this.pid,
-    this.containerId,
-    this.containerName,
-  });
-
-  final String protocol;
-  final String address;
-  final int port;
-  final String process;
-  final int? pid;
-  final String? containerId;
-  final String? containerName;
-
-  String get exposure {
-    final normalized = normalizeAddress(address);
-    if (normalized == null) return 'Unknown';
-    if (normalized == '127.0.0.1' || normalized == '::1') return 'Local only';
-    if (normalized == '0.0.0.0' || normalized == '::') return 'Network exposed';
-    return 'Interface-specific';
-  }
-
-  String get source =>
-      containerName == null ? 'Process' : 'Docker: $containerName';
-
-  String get searchable =>
-      '$protocol $address $port $process ${pid ?? ''} $source $exposure'
-          .toLowerCase();
-}
-
-class ContainerBinding {
-  const ContainerBinding(
-    this.address,
-    this.hostPort,
-    this.protocol,
-    this.id,
-    this.name,
-  );
-  final String address;
-  final int hostPort;
-  final String protocol;
-  final String id;
-  final String name;
-}
-
-class ActionResult {
-  const ActionResult(this.success, this.message);
-  final bool success;
-  final String message;
-}
-
-String? normalizeAddress(String value) {
-  var address = value.trim();
-  if (address.startsWith('[') && address.endsWith(']')) {
-    address = address.substring(1, address.length - 1);
-  }
-  if (address == '*') return null;
-  address = address.split('%').first;
-  if (InternetAddress.tryParse(address) == null) return null;
-  return InternetAddress(address).address;
-}
-
-Future<ProcessResult> runCommand(
-  List<String> command, {
-  Duration timeout = const Duration(seconds: 15),
-}) {
-  return Process.run(command.first, command.sublist(1)).timeout(timeout);
-}
-
-Future<List<Listener>> discoverListeners({bool admin = false}) async {
-  final command = Platform.isWindows
-      ? <String>['netstat', '-ano']
-      : <String>['ss', '-H', '-ltnup'];
-  if (admin && !Platform.isWindows) command.insertAll(0, ['pkexec']);
-  late ProcessResult result;
-  try {
-    result = await runCommand(command);
-  } on TimeoutException {
-    throw Exception('Listener discovery timed out.');
-  } on ProcessException catch (error) {
-    throw Exception(error.message);
-  }
-  if (result.exitCode != 0) {
-    throw Exception(
-      '${result.stderr}'.trim().isEmpty
-          ? 'Listener discovery failed.'
-          : result.stderr,
-    );
-  }
-  final listeners = Platform.isWindows
-      ? parseNetstatListeners('${result.stdout}')
-      : parseListeners('${result.stdout}');
-  final bindings = await discoverDockerBindings();
-  return listeners.map((listener) => correlate(listener, bindings)).toList()
-    ..sort(
-      (a, b) => a.port != b.port
-          ? a.port.compareTo(b.port)
-          : a.protocol.compareTo(b.protocol),
-    );
-}
-
-List<Listener> parseNetstatListeners(String output) {
-  final listeners = <Listener>[];
-  for (final line in output.split('\n')) {
-    final parts = line.trim().split(RegExp(r'\s+'));
-    if (parts.length < 4) continue;
-    final protocol = parts.first.toLowerCase();
-    if (protocol != 'tcp' && protocol != 'udp') continue;
-    final endpoint = parseEndpoint(parts[1]);
-    if (endpoint == null) continue;
-    if (protocol == 'tcp' &&
-        (parts.length < 5 || parts[3].toUpperCase() != 'LISTENING')) {
-      continue;
-    }
-    final pid = int.tryParse(parts.last);
-    if (pid == null) continue;
-    listeners.add(
-      Listener(
-        protocol: protocol,
-        address: endpoint.$1,
-        port: endpoint.$2,
-        pid: pid,
-      ),
-    );
-  }
-  return listeners;
-}
-
-List<Listener> parseListeners(String output) {
-  final listeners = <Listener>[];
-  final processPattern = RegExp(r'users:\(\("([^"]+)",pid=(\d+)');
-  for (final line in output.split('\n')) {
-    final parts = line.trim().split(RegExp(r'\s+'));
-    if (parts.length < 5 ||
-        !{'tcp', 'udp'}.contains(parts.first.toLowerCase())) {
-      continue;
-    }
-    final endpoint = parseEndpoint(parts[4]);
-    if (endpoint == null) continue;
-    final match = processPattern.firstMatch(parts.skip(5).join(' '));
-    listeners.add(
-      Listener(
-        protocol: parts.first.toLowerCase(),
-        address: endpoint.$1,
-        port: endpoint.$2,
-        process: match?.group(1) ?? '-',
-        pid: match == null ? null : int.tryParse(match.group(2)!),
-      ),
-    );
-  }
-  return listeners;
-}
-
-(String, int)? parseEndpoint(String value) {
-  if (value.startsWith('[')) {
-    final match = RegExp(r'^\[([^]]+)\]:(\d+)$').firstMatch(value);
-    return match == null ? null : (match.group(1)!, int.parse(match.group(2)!));
-  }
-  final separator = value.lastIndexOf(':');
-  if (separator < 1) return null;
-  final port = int.tryParse(value.substring(separator + 1));
-  return port == null || port < 0 || port > 65535
-      ? null
-      : (value.substring(0, separator), port);
-}
-
-Future<List<ContainerBinding>> discoverDockerBindings() async {
-  try {
-    final result = await runCommand([
-      'docker',
-      'ps',
-      '--format',
-      '{{json .}}',
-    ], timeout: const Duration(seconds: 5));
-    if (result.exitCode != 0) return [];
-    final bindings = <ContainerBinding>[];
-    for (final line in '${result.stdout}'.split('\n')) {
-      try {
-        final item = jsonDecode(line) as Map<String, dynamic>;
-        final id = item['ID'];
-        final ports = item['Ports'];
-        if (id is! String || id.isEmpty || ports is! String) continue;
-        final rawName = item['Names'];
-        final name = rawName is String && rawName.isNotEmpty
-            ? rawName
-            : id.substring(0, id.length.clamp(0, 12));
-        final pattern = RegExp(
-          r'(?:^|,\s*)(\[[^]]+\]|[^:,\s]+):(\d+)->\d+\/(tcp|udp)',
-          caseSensitive: false,
-        );
-        for (final match in pattern.allMatches(ports)) {
-          final address = normalizeAddress(match.group(1)!);
-          if (address != null) {
-            bindings.add(
-              ContainerBinding(
-                address,
-                int.parse(match.group(2)!),
-                match.group(3)!.toLowerCase(),
-                id,
-                name,
-              ),
-            );
-          }
-        }
-      } catch (_) {}
-    }
-    return bindings;
-  } catch (_) {
-    return [];
-  }
-}
-
-Listener correlate(Listener listener, List<ContainerBinding> bindings) {
-  final address = normalizeAddress(listener.address);
-  if (address == null) return listener;
-  final matches = bindings.where(
-    (binding) =>
-        binding.hostPort == listener.port &&
-        binding.protocol == listener.protocol,
-  );
-  final exact = matches.where((binding) => binding.address == address).toList();
-  if (exact.length != 1) return listener;
-  final binding = exact.first;
-  return Listener(
-    protocol: listener.protocol,
-    address: listener.address,
-    port: listener.port,
-    process: binding.name,
-    pid: listener.pid,
-    containerId: binding.id,
-    containerName: binding.name,
-  );
-}
-
 class PortGuardianPage extends StatefulWidget {
   const PortGuardianPage({super.key});
 
@@ -275,7 +40,7 @@ class PortGuardianPage extends StatefulWidget {
 
 class _PortGuardianPageState extends State<PortGuardianPage> {
   final searchController = TextEditingController();
-  List<Listener> entries = [];
+  List<ListenerObject> entries = [];
   bool adminScan = false;
   bool loading = false;
   String status = 'Ready to scan listening sockets';
@@ -301,7 +66,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
       status = 'Scanning listening sockets...';
     });
     try {
-      final result = await discoverListeners(admin: adminScan);
+      final result = await Services.discoverListeners(admin: adminScan);
       if (!mounted) return;
       setState(() {
         entries = result;
@@ -319,7 +84,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
     }
   }
 
-  List<Listener> get visibleEntries {
+  List<ListenerObject> get visibleEntries {
     final query = searchController.text.trim().toLowerCase();
     return entries
         .where((entry) => query.isEmpty || entry.searchable.contains(query))
@@ -473,7 +238,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
     );
   }
 
-  Future<void> confirmStop(Listener listener) async {
+  Future<void> confirmStop(ListenerObject listener) async {
     final target = listener.containerId != null
         ? 'Docker container ${listener.containerName}'
         : listener.pid != null
@@ -506,7 +271,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
     if (shouldStop) await stop(listener);
   }
 
-  Future<void> stop(Listener listener) async {
+  Future<void> stop(ListenerObject listener) async {
     setState(() => status = 'Requesting stop for port ${listener.port}...');
     final ActionResult result;
     if (listener.containerId != null) {
@@ -537,7 +302,7 @@ class _PortGuardianPageState extends State<PortGuardianPage> {
 Future<ActionResult> terminateProcess(int pid) async {
   try {
     if (Platform.isWindows) {
-      final result = await runCommand([
+      final result = await Services.runCommand([
         'taskkill',
         '/PID',
         '$pid',
@@ -553,14 +318,14 @@ Future<ActionResult> terminateProcess(int pid) async {
                   : '${result.stderr}'.trim(),
             );
     }
-    var result = await runCommand([
+    var result = await Services.runCommand([
       'kill',
       '-TERM',
       '$pid',
     ], timeout: const Duration(seconds: 3));
     if (result.exitCode != 0 &&
         '${result.stderr}'.toLowerCase().contains('permission')) {
-      result = await runCommand(['pkexec', 'kill', '-TERM', '$pid']);
+      result = await Services.runCommand(['pkexec', 'kill', '-TERM', '$pid']);
     }
     return result.exitCode == 0
         ? const ActionResult(true, 'SIGTERM was sent to the process.')
@@ -577,7 +342,7 @@ Future<ActionResult> terminateProcess(int pid) async {
 
 Future<ActionResult> terminateByPort(int port, String protocol) async {
   try {
-    final result = await runCommand([
+    final result = await Services.runCommand([
       'pkexec',
       'fuser',
       '-k',
@@ -601,7 +366,7 @@ Future<ActionResult> terminateByPort(int port, String protocol) async {
 
 Future<ActionResult> stopContainer(String id) async {
   try {
-    final result = await runCommand([
+    final result = await Services.runCommand([
       'docker',
       'stop',
       id,
@@ -624,7 +389,7 @@ Future<ActionResult> stopContainer(String id) async {
 
 class ListenerTile extends StatelessWidget {
   const ListenerTile({super.key, required this.listener, required this.onStop});
-  final Listener listener;
+  final ListenerObject listener;
   final VoidCallback onStop;
 
   @override
